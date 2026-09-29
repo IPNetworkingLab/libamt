@@ -56,6 +56,13 @@ struct amt_gateway {
 	uint32_t query_interval_sec; /* from the relay's QQIC, or a
 	                                 conservative default until learned */
 	time_t refresh_deadline;     /* when to next call amt_gateway_timeout() */
+
+	struct sockaddr_storage local_addr; /* our address as seen reaching the
+	                                        relay; lazily determined, used as
+	                                        the IP source when encapsulating
+	                                        the Membership Update's IGMPv3
+	                                        report (see determine_local_addr()) */
+	socklen_t local_addr_len;
 };
 
 static uint32_t rand32(void) {
@@ -112,6 +119,23 @@ static const void *addr_bytes(const struct sockaddr *sa, int *len) {
 	}
 	*len = 0;
 	return NULL;
+}
+
+/* Standard Internet checksum (RFC 1071): 16-bit one's complement sum. */
+static uint16_t checksum16(const void *data, size_t len) {
+	const uint8_t *p = (const uint8_t *)data;
+	uint32_t sum = 0;
+
+	while (len > 1) {
+		sum += ((uint32_t)p[0] << 8) | p[1];
+		p += 2;
+		len -= 2;
+	}
+	if (len)
+		sum += (uint32_t)p[0] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (uint16_t)~sum;
 }
 
 static void sockaddr_set_port(struct sockaddr_storage *ss, uint16_t port) {
@@ -193,11 +217,43 @@ static int parse_query_interval(const uint8_t *rbuf, size_t n, int relay_family,
 }
 
 /*
+ * Determines the local address to use as the IP source when encapsulating
+ * the Membership Update's IGMPv3 report (see build_membership_report()):
+ * connect()s a throwaway UDP socket to the relay's tunnel endpoint and
+ * reads back what the kernel picked as the outgoing source address, the
+ * same trick a reference Python implementation of this protocol uses
+ * (probe.connect() + getsockname()). Idempotent: a no-op once already
+ * determined. Returns 0 on success, -1 on failure (errno set).
+ */
+static int determine_local_addr(amt_gateway_t *gw) {
+	if (gw->local_addr_len != 0)
+		return 0;
+
+	int s = socket(sockaddr_family((const struct sockaddr *)&gw->relay_tunnel), SOCK_DGRAM, 0);
+	if (s < 0)
+		return -1;
+
+	if (connect(s, (const struct sockaddr *)&gw->relay_tunnel, gw->relay_tunnel_len) != 0) {
+		close(s);
+		return -1;
+	}
+
+	socklen_t len = sizeof(gw->local_addr);
+	if (getsockname(s, (struct sockaddr *)&gw->local_addr, &len) != 0) {
+		close(s);
+		return -1;
+	}
+	gw->local_addr_len = len;
+	close(s);
+	return 0;
+}
+
+/*
  * Builds a minimal IGMPv3 (AF_INET) or MLDv2 (AF_INET6) Membership Report
  * carrying a single multicast address record for 'gw's joined channel.
  * Returns the number of bytes written, or -1 if it doesn't fit in 'buf'.
  */
-static int build_membership_report(const struct amt_gateway *gw, uint8_t *buf, size_t buflen) {
+static int build_membership_report(struct amt_gateway *gw, uint8_t *buf, size_t buflen) {
 	int family = gw->group_len ? sockaddr_family((const struct sockaddr *)&gw->group) : AF_INET;
 	int alen = (family == AF_INET6) ? 16 : 4;
 	int numsrc = gw->ssm ? 1 : 0;
@@ -209,15 +265,14 @@ static int build_membership_report(const struct amt_gateway *gw, uint8_t *buf, s
 		 * then one Group Record: rec_type(1) auxlen(1)=0 numsrc(2)
 		 *                        group(4) source[numsrc](4 each)
 		 */
-		size_t need = 8 + 8 + (size_t)numsrc * 4;
-		if (buflen < need)
-			return -1;
+		uint8_t report[8 + 8 + 4];
+		size_t rlen = 8 + 8 + (size_t)numsrc * 4;
 
-		memset(buf, 0, need);
-		buf[0] = 0x22; /* IGMP Membership Report v3 */
-		put16(buf + 6, 1); /* Number of Group Records */
+		memset(report, 0, rlen);
+		report[0] = 0x22; /* IGMP Membership Report v3 */
+		put16(report + 6, 1); /* Number of Group Records */
 
-		uint8_t *rec = buf + 8;
+		uint8_t *rec = report + 8;
 		rec[0] = rec_type;
 		rec[1] = 0; /* Aux Data Len */
 		put16(rec + 2, (uint16_t)numsrc);
@@ -232,12 +287,51 @@ static int build_membership_report(const struct amt_gateway *gw, uint8_t *buf, s
 			memcpy(rec + 4 + alen, sbytes, slen);
 		}
 
-		/* checksum left as 0: dbeacon/AMT relays do not require an IGMP
-		 * checksum here since this report never traverses a real IGMP
-		 * router - it is only ever inspected by the AMT relay's gateway
-		 * logic, per common implementation practice. If strict relays
-		 * reject unchecksummed reports, computing it is a follow-up. */
-		return (int)need;
+		put16(report + 2, checksum16(report, rlen));
+
+		/*
+		 * RFC 7450 5.1.5 says this field carries "a valid IGMPv3 ...
+		 * protocol message" - for IGMPv3 (RFC 3376) that means the
+		 * full IP-encapsulated packet (source/destination addresses,
+		 * protocol, Router Alert option, TTL 1), not just the bare
+		 * group-record bytes above. A relay that actually validates
+		 * that framing silently drops an Update that omits it: the
+		 * handshake (Discovery/Request/Query) still completes, since
+		 * none of that involves this field, but the join itself never
+		 * registers and no data ever follows. Encapsulate exactly as
+		 * a real IGMPv3 report would arrive on the wire, destined to
+		 * 224.0.0.22 ("all IGMPv3-capable multicast routers", RFC
+		 * 3376 4.2.14).
+		 */
+		if (determine_local_addr(gw) != 0)
+			return -1;
+
+		size_t iplen = 24 + rlen; /* 20-byte header + 4-byte Router Alert option */
+		if (buflen < iplen)
+			return -1;
+
+		uint8_t *ip = buf;
+		memset(ip, 0, 24);
+		ip[0] = 0x46; /* version 4, IHL 6 (24 bytes, incl. Router Alert) */
+		ip[1] = 0xc0; /* DSCP/ECN: matches common IGMP control-traffic marking */
+		put16(ip + 2, (uint16_t)iplen);
+		put16(ip + 4, (uint16_t)rand32()); /* identification */
+		ip[8] = 1;  /* TTL: IGMP reports never leave the local network */
+		ip[9] = 2;  /* protocol: IGMP */
+		/* ip[10..11] (header checksum) filled in below, once complete */
+		int llen;
+		const void *lbytes = addr_bytes((const struct sockaddr *)&gw->local_addr, &llen);
+		memcpy(ip + 12, lbytes, llen);
+		{
+			struct in_addr dst;
+			inet_pton(AF_INET, "224.0.0.22", &dst);
+			memcpy(ip + 16, &dst, 4);
+		}
+		ip[20] = 0x94; ip[21] = 0x04; ip[22] = 0x00; ip[23] = 0x00; /* Router Alert option */
+		put16(ip + 10, checksum16(ip, 24));
+
+		memcpy(ip + 24, report, rlen);
+		return (int)iplen;
 	} else {
 		/* MLDv2 Report (ICMPv6 type 143):
 		 * type(1)=143 reserved(1) checksum(2) reserved(2) numrecords(2)
@@ -267,15 +361,20 @@ static int build_membership_report(const struct amt_gateway *gw, uint8_t *buf, s
 			memcpy(rec + 4 + 16, sbytes, slen);
 		}
 
-		/* ICMPv6 checksum is normally mandatory, but as with IGMPv3 above
-		 * this report is only consumed by the AMT relay's gateway-facing
-		 * logic, not routed as a real MLD packet. */
+		/* Unlike the IGMPv3/AF_INET case above, this is NOT wrapped in an
+		 * IPv6+Router Alert+ICMPv6-checksummed packet the way a real MLDv2
+		 * report would be (RFC 3810) - the same defect that made the
+		 * IGMPv3 path fail against a relay that validates the framing
+		 * (see the comment there) most likely also affects this path, but
+		 * it is unverified: there is no MLDv2/IPv6 relay this has been
+		 * tested against, and no reference implementation to check the
+		 * fix against, so it is left as-is pending an IPv6 test case. */
 		return (int)need;
 	}
 }
 
 static int send_membership_update(amt_gateway_t *gw) {
-	uint8_t buf[64];
+	uint8_t buf[96]; /* header(12) + IP-encapsulated IGMPv3 report (<= 44) */
 	int off = 0;
 
 	/* header is 2 bytes (V|Type, then Reserved); the 48-bit Response MAC
@@ -641,7 +740,21 @@ ssize_t amt_gateway_recv(amt_gateway_t *gw,
 	int type = rbuf[0] & 0xf;
 
 	if (type == AMT_TYPE_MULTICAST_DATA) {
-		return parse_encapsulated_udp(rbuf + 4, (size_t)n - 4,
+		/* Header is 2 bytes (V|Type, then Reserved), same shape as every
+		 * other AMT message here - NOT 4, despite what an earlier reading
+		 * of RFC 7450's Figure 16 concluded (see amt.md's design notes).
+		 * Confirmed against a real relay's live traffic (GEANT,
+		 * 62.40.96.44/41): byte 2 of the datagram is already 0x45
+		 * (IPv4, IHL 5), and the IP header's Total Length field equals
+		 * n - 2 exactly, not n - 4. This code path was never exercised
+		 * against real traffic before now - a *different* bug (the
+		 * Membership Update lacking IP encapsulation, see
+		 * build_membership_report()) meant no relay ever accepted the
+		 * join for real, so no genuine Multicast Data message had ever
+		 * reached this function until both bugs were found together. */
+		if (n < 2)
+			return 0;
+		return parse_encapsulated_udp(rbuf + 2, (size_t)n - 2,
 		                                from, from_len, to, to_len, ttl, buf, buflen);
 	}
 
