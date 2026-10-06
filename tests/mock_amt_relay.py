@@ -24,7 +24,8 @@ def build_multicast_data(src_ip, dst_ip, src_port, dst_port, payload, ttl=64):
         0x45, 0, ip_total_len, 0, 0, ttl, 17, 0,
         socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
     )
-    return bytes([6, 0, 0, 0]) + ip_hdr + udp_hdr + payload
+    # Multicast Data header is 2 bytes (V|Type, Reserved)
+    return bytes([6, 0]) + ip_hdr + udp_hdr + payload
 
 
 def build_general_query(relay_ip, qqic, max_resp_code=100, qrv=2):
