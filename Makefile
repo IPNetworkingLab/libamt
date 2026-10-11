@@ -16,4 +16,7 @@ clean:
 test-amt-netns:
 	sudo tests/run_netns_test.sh
 
+test-amt-netns-rust:
+	sudo tests/run_netns_test_rust.sh
+
 .PHONY: all clean test-amt-netns

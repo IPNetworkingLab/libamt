@@ -9,12 +9,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+libc = { workspace = true }
 
 [build-dependencies]
 cc = "1"
 
 [dev-dependencies]
-libc = { workspace = true }
+# libc = { workspace = true }
 
 [[test]]
 name = "test_amt_gateway_rust"
