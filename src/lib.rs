@@ -1373,3 +1373,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn amt_gateway_close(gw: *mut amt_gateway_t);
 }
+unsafe extern "C" {
+    /// Returns the gateway's current query interval in seconds
+    pub fn amt_gateway_query_interval_sec(
+        gw: *const amt_gateway_t,
+    ) -> ::std::os::raw::c_int;
+}

@@ -597,41 +597,52 @@ int amt_gateway_timeout(amt_gateway_t *gw) {
 	sbuf[2] = 0;
 	sbuf[3] = 0;
 	put32(sbuf + 4, gw->request_nonce);
-
-	if (sendto(gw->sock, sbuf, 8, 0, (const struct sockaddr *)&gw->relay_tunnel,
-	           gw->relay_tunnel_len) != 8)
-		return -1;
-
+	
 	/* Re-arm immediately so a lost Request/Query doesn't silently wedge
 	 * this until the full interval elapses again; refined further once a
 	 * fresh Membership Query actually arrives (amt_gateway_recv() above
 	 * reschedules from the relay's own QQIC at that point). */
 	gw->refresh_deadline = time(NULL) + (time_t)gw->query_interval_sec;
 
+	if (sendto(gw->sock, sbuf, 8, 0, (const struct sockaddr *)&gw->relay_tunnel,
+	           gw->relay_tunnel_len) != 8)
+		return -1;
+
 	return 0;
+}
+
+int amt_gateway_query_interval_sec(const amt_gateway_t *gw) {
+    return (int)gw->query_interval_sec;
+}
+
+/* Sets errno to 'err' and returns -1, for parse_encapsulated_udp(). */
+static ssize_t parse_fail(int err) {
+	errno = err;
+	return -1;
 }
 
 /* Parses an encapsulated IPv4/IPv6+UDP packet (as delivered inside an AMT
  * Multicast Data message) and extracts source/destination/ttl and the
- * inner UDP payload. Returns the payload length, or -1 if malformed / not
- * UDP. */
+ * inner UDP payload. Returns the payload length, or -1 with errno set to
+ * EBADMSG if the packet is malformed / truncated, or EPROTONOSUPPORT if it
+ * is not UDP (or an unsupported IP version / IPv6 extension header). */
 static ssize_t parse_encapsulated_udp(const uint8_t *pkt, size_t len,
                                         struct sockaddr_storage *from, socklen_t *from_len,
                                         struct sockaddr_storage *to, socklen_t *to_len,
                                         int *ttl, uint8_t *buf, size_t buflen) {
 	if (len < 1)
-		return -1;
+		return parse_fail(EBADMSG);
 
 	int version = pkt[0] >> 4;
 
 	if (version == 4) {
 		if (len < 20)
-			return -1;
+			return parse_fail(EBADMSG);
 		int ihl = (pkt[0] & 0xf) * 4;
 		if ((size_t)ihl < 20 || len < (size_t)ihl + 8)
-			return -1;
+			return parse_fail(EBADMSG);
 		if (pkt[9] != 17) /* not UDP */
-			return -1;
+			return parse_fail(EPROTONOSUPPORT);
 
 		int iplen = get16(pkt + 2);
 		if ((size_t)iplen > len)
@@ -648,14 +659,14 @@ static ssize_t parse_encapsulated_udp(const uint8_t *pkt, size_t len,
 
 		const uint8_t *udp = pkt + ihl;
 		if ((size_t)(udp - pkt) + 8 > (size_t)iplen)
-			return -1;
+			return parse_fail(EBADMSG);
 
 		src.sin_port = htons(get16(udp + 0));
 		dst.sin_port = htons(get16(udp + 2));
 
 		int udplen = get16(udp + 4);
 		if (udplen < 8)
-			return -1;
+			return parse_fail(EBADMSG);
 		size_t paylen = (size_t)udplen - 8;
 		if ((size_t)(udp - pkt) + (size_t)udplen > (size_t)iplen)
 			paylen = (size_t)iplen - (udp - pkt) - 8;
@@ -674,9 +685,9 @@ static ssize_t parse_encapsulated_udp(const uint8_t *pkt, size_t len,
 		return (ssize_t)paylen;
 	} else if (version == 6) {
 		if (len < 40)
-			return -1;
+			return parse_fail(EBADMSG);
 		if (pkt[6] != 17) /* Next Header must be UDP (no extension headers handled) */
-			return -1;
+			return parse_fail(EPROTONOSUPPORT);
 
 		int payload_len = get16(pkt + 4);
 		int hoplimit = pkt[7];
@@ -691,14 +702,14 @@ static ssize_t parse_encapsulated_udp(const uint8_t *pkt, size_t len,
 		const uint8_t *udp = pkt + 40;
 		size_t avail = len - 40;
 		if (avail < 8 || (size_t)payload_len < 8)
-			return -1;
+			return parse_fail(EBADMSG);
 
 		src.sin6_port = htons(get16(udp + 0));
 		dst.sin6_port = htons(get16(udp + 2));
 
 		int udplen = get16(udp + 4);
 		if (udplen < 8)
-			return -1;
+			return parse_fail(EBADMSG);
 		size_t paylen = (size_t)udplen - 8;
 		if (paylen > avail - 8)
 			paylen = avail - 8;
@@ -717,7 +728,7 @@ static ssize_t parse_encapsulated_udp(const uint8_t *pkt, size_t len,
 		return (ssize_t)paylen;
 	}
 
-	return -1;
+	return parse_fail(EPROTONOSUPPORT);
 }
 
 ssize_t amt_gateway_recv(amt_gateway_t *gw,

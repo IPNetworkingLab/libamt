@@ -114,7 +114,11 @@ int amt_gateway_timeout(amt_gateway_t *gw);
  * the caller this call).
  *
  * Returns -1 on error (errno set, e.g. EAGAIN if the socket is non-blocking
- * and nothing was available).
+ * and nothing was available). A Multicast Data message whose encapsulated
+ * packet cannot be delivered also returns -1, with errno set to EBADMSG
+ * (malformed / truncated) or EPROTONOSUPPORT (not UDP, or an unsupported IP
+ * version / IPv6 extension header); the datagram is consumed, so the caller
+ * can skip it and keep reading.
  */
 ssize_t amt_gateway_recv(amt_gateway_t *gw,
                           struct sockaddr_storage *from, socklen_t *from_len,
@@ -125,6 +129,9 @@ ssize_t amt_gateway_recv(amt_gateway_t *gw,
  * Best-effort teardown of the tunnel and release of the handle.
  */
 void amt_gateway_close(amt_gateway_t *gw);
+
+/// Returns the gateway's current query interval in seconds
+int amt_gateway_query_interval_sec(const amt_gateway_t *gw);
 
 #ifdef __cplusplus
 }
